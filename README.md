@@ -1,68 +1,70 @@
-# E-commerce — Projeto 4
+# E-commerce — Projeto 4 (fila de e-mail com Redis)
 
-Este é o e-commerce do Projeto 3 já resolvido: API e PostgreSQL em containers, com a rota `GET /orders/:id`. Ele é o ponto de partida deste trabalho. Se você fez o Projeto 3, pode usar o seu código.
+API de pedidos em Node.js/TypeScript com PostgreSQL. O e-mail de confirmação não é mais enviado dentro do `POST /orders`: a API publica o pedido numa fila do Redis e um **worker**, em outro container, envia o e-mail.
 
 ## Como rodar
+
+Requisitos: Docker e Docker Compose.
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-A API sobe em `http://localhost:3000`. Teste com:
+A API sobe em `http://localhost:3000`. O banco e o Redis ficam só na rede interna do Compose, sem porta publicada.
+
+## Como testar
+
+Crie um pedido:
 
 ```bash
 curl -X POST http://localhost:3000/orders \
 -H "Content-Type: application/json" \
--d '{
-  "customer": "cliente@ethereal.email",
-  "items": [{ "productId": 1, "quantity": 1 }],
-  "paymentMethod": "pix"
-}'
+-d '{"customer":"cliente@ethereal.email","items":[{"productId":1,"quantity":1}],"paymentMethod":"pix"}'
 ```
 
----
+A resposta volta na hora, com `orderId` e `total`. O e-mail aparece no log do worker:
 
-## Trabalho
+```bash
+docker compose logs -f worker
+```
 
-Hoje o pedido só responde depois que o e-mail é enviado, e uma falha no e-mail derruba o pedido. Tire o envio de e-mail da API: ela deve publicar o pedido numa fila do Redis, e um **worker**, em outro container, deve ler a fila e enviar o e-mail.
+Consulte o pedido: `curl http://localhost:3000/orders/1` (404 se não existir).
 
-### Já pronto
+**Worker parado.** Os pedidos esperam na fila e os e-mails saem quando o worker volta:
 
-* O pacote `redis` já está instalado.
-* O script `npm run worker`, que executa o `src/worker.ts`.
-* O `.env.example`, com o `REDIS_URL` apontando para o serviço `redis`.
+```bash
+docker compose stop worker
+# crie alguns pedidos com o curl acima
+docker compose start worker
+```
 
-### 1. Publique o pedido numa fila
+**Dois workers.** Cada pedido é enviado uma única vez:
 
-* Crie a interface `IOrderQueue`, com o método `publish(order)`.
-* Crie a `RedisOrderQueue`, que implementa a interface e grava o pedido numa lista do Redis com `LPUSH`.
-* O `OrderService` deixa de chamar o `NotificationService`. Ele grava o pedido, publica na fila e responde.
-* O `OrderService` conhece só a interface. A `RedisOrderQueue` é registrada no `container.ts`.
+```bash
+docker compose up -d --scale worker=2
+```
 
-### 2. Crie o worker
+## Como funciona
 
-* Crie `src/worker.ts`. Ele lê a fila com `BRPOP` e, para cada pedido, chama o `NotificationService`.
-* O worker pega o `NotificationService` do container, como a API faz com o controller.
+```
+POST /orders -> OrderService -> grava o pedido -> IOrderQueue.publish() -> responde
+                                                        |
+                                                  Redis (lista)
+                                                        |
+                                    worker: BRPOP -> NotificationService -> e-mail
+```
 
-### 3. Atualize o Compose
+| Arquivo | Papel |
+|---------|-------|
+| `src/queue/IOrderQueue.ts` | Interface da fila (`publish`). É a única que o `OrderService` conhece. |
+| `src/queue/RedisOrderQueue.ts` | Implementação: grava o pedido na lista `orders:email` com `LPUSH`. |
+| `src/worker.ts` | Lê a lista com `BRPOP` e chama o `NotificationService` para cada pedido. |
+| `src/container/container.ts` | Registra a `RedisOrderQueue` como `IOrderQueue`. |
+| `compose.yaml` | Serviços `banco`, `redis`, `api` e `worker` (mesmo `Dockerfile` da API). |
 
-* Acrescente o serviço `redis`, **sem porta publicada**.
-* Acrescente o serviço `worker`, com o mesmo `Dockerfile` da API e o comando `npm run worker`.
+Nenhum arquivo de `services/` ou `controllers/` importa o Redis.
 
-### 4. Escreva um ADR
+## Decisão de arquitetura
 
-Crie `docs/adr-001-fila-de-email.md` com três seções: **Contexto**, **Decisão** e **Consequências**. Explique por que usar uma lista do Redis (`LPUSH` / `BRPOP`), e não publish/subscribe.
-
-### Critérios de aceite
-
-1. Clonar, `cp .env.example .env` e `docker compose up --build` sobem tudo sem erro.
-2. `POST /orders` responde sem esperar o e-mail. O e-mail aparece no log do worker.
-3. Com o worker parado (`docker compose stop worker`), os pedidos esperam na fila. Quando ele volta, os e-mails são enviados.
-4. Com dois workers (`docker compose up -d --scale worker=2`), cada pedido é enviado uma vez só.
-5. Nenhum arquivo de `services/` ou `controllers/` importa o Redis.
-6. O ADR está no repositório.
-
-### Entrega
-
-Pelo git. Informe na caixa de texto do AVA o link do repositório. Ele não pode estar privado: teste antes de entregar.
+O motivo de usar uma lista do Redis (`LPUSH`/`BRPOP`) em vez de publish/subscribe está em [`docs/adr-001-fila-de-email.md`](docs/adr-001-fila-de-email.md).
